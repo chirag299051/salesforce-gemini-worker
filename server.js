@@ -211,105 +211,72 @@ async function updateWorkItemStatus(conn, workItemId, status, errorDetail) {
 
 app.post("/process", async (req, res) => {
   try {
-    // Basic auth: check header
     const authHeader = req.headers["authorization"];
     if (!authHeader || authHeader !== `Bearer ${WORKER_SECRET}`) {
+      console.warn(
+        "Unauthorized request, auth header:",
+        req.headers["authorization"]
+      );
       return res.status(403).json({ error: "Forbidden" });
     }
-
     const items = req.body;
     if (!Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: "Expected array of work items" });
+      console.warn("Bad payload:", JSON.stringify(items).slice(0, 200));
+      return res
+        .status(400)
+        .json({ error: "Expected non-empty array of work items" });
     }
 
-    // Login once per request (reuse connection)
-    const conn = await getSalesforceConnection();
-
-    // Process items sequentially (one by one). For higher throughput you can parallelize carefully.
+    const conn = await getSalesforceConnection(); // your JWT exchange helper
     for (const it of items) {
-      const workItemId = it.workItemId;
-      const contentDocumentId = it.contentDocumentId;
-      const linkedEntityId = it.linkedEntityId;
-
       try {
-        console.log("Processing", workItemId, contentDocumentId);
-
-        // Download PDF
-        const { buffer, title, versionId } = await downloadPdfBuffer(
-          conn,
-          contentDocumentId
-        );
-
-        // Compose prompt (you can refine prompt for strict JSON)
-        const prompt =
-          'Extract the following fields and return ONLY valid JSON: { "title":"", "patientName":"", "claimedAmount":"", "approvedAmount":"", "lineItems":[{"lineNumber":"","productName":"","description":"","quantity":"","unit":"","rcv":"","depreciation":"","acv":"","tax":"","op":"","section":""}] }';
-
-        // Call Gemini (multipart)
-        const geminiResp = await callGeminiWithPdf(
-          buffer,
-          title || "file.pdf",
-          prompt
-        );
-
-        // geminiResp should be JSON. If not, try parsing string
-        let parsed;
-        if (typeof geminiResp === "object") {
-          parsed = geminiResp;
-        } else if (typeof geminiResp === "string") {
-          try {
-            parsed = JSON.parse(geminiResp);
-          } catch (e) {
-            throw new Error(
-              "Gemini returned non-JSON or malformed JSON: " + e.message
-            );
-          }
-        } else {
-          throw new Error("Unexpected Gemini response type");
-        }
-
-        // Persist parsed JSON to Salesforce
-        const claimId = await persistParsedToSalesforce(
-          conn,
-          parsed,
-          linkedEntityId
-        );
-
-        // Update work item as completed and link to claim
-        await updateWorkItemStatus(conn, workItemId, "Completed", null);
-        try {
-          await conn
-            .sobject("PDF_Work_Item__c")
-            .update({ Id: workItemId, Processed_Claim__c: claimId });
-        } catch (e) {
-          console.warn("Failed to update Processed_Claim__c: ", e.message);
-        }
-
-        console.log("Processed workItem", workItemId, "claim", claimId);
-      } catch (errItem) {
+        if (!it.contentDocumentId) throw new Error("missing contentDocumentId");
+        // process item (download pdf, call gemini, persist result)...
+      } catch (itemErr) {
         console.error(
-          "Error processing item",
-          workItemId,
-          errItem && errItem.message ? errItem.message : errItem
+          "Item processing error:",
+          itemErr && itemErr.stack ? itemErr.stack : itemErr
         );
+        // update work item as Error in Salesforce if possible
         try {
           await updateWorkItemStatus(
             conn,
-            workItemId,
+            it.workItemId,
             "Error",
-            errItem.message || String(errItem)
+            String(itemErr.message || itemErr)
           );
-        } catch (e) {
-          console.error("Failed to update workItem error status", e.message);
+        } catch (updErr) {
+          console.error(
+            "Failed to update work item status for",
+            it.workItemId,
+            updErr && updErr.message
+          );
         }
+        // continue processing other items
       }
     }
 
     return res.status(202).json({ status: "accepted", count: items.length });
   } catch (err) {
-    console.error("Worker failure", err && err.stack ? err.stack : err);
-    return res
-      .status(500)
-      .json({ error: err && err.message ? err.message : String(err) });
+    // If axios error, include server's response body (helpful)
+    let detail = String(err && err.message ? err.message : err);
+    if (err && err.response && err.response.data) {
+      try {
+        detail +=
+          " | remote:" +
+          (typeof err.response.data === "string"
+            ? err.response.data
+            : JSON.stringify(err.response.data));
+      } catch (e) {
+        detail += " | (error serializing remote response)";
+      }
+    }
+    console.error(
+      "Fatal worker error:",
+      detail,
+      err && err.stack ? err.stack : ""
+    );
+    return res.status(500).json({ error: detail });
   }
 });
 

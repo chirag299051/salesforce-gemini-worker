@@ -29,14 +29,71 @@ if (
   process.exit(1);
 }
 
-// JWT auth to Salesforce
+const jwt = require("jsonwebtoken");
+const querystring = require("querystring");
+
+// helper: perform JWT Bearer flow and return an authenticated jsforce Connection
 async function getSalesforceConnection() {
-  const conn = new jsforce.Connection({ loginUrl: SF_LOGIN_URL });
-  await conn.jwtLogin({
-    username: SF_USERNAME,
-    privateKey: SF_PRIVATE_KEY,
-    clientId: SF_CLIENT_ID,
+  // Required env vars: SF_LOGIN_URL, SF_CLIENT_ID, SF_USERNAME, SF_PRIVATE_KEY
+  const loginUrl = process.env.SF_LOGIN_URL || "https://login.salesforce.com";
+  const clientId = process.env.SF_CLIENT_ID;
+  const username = process.env.SF_USERNAME;
+  const privateKey = process.env.SF_PRIVATE_KEY;
+
+  if (!clientId || !username || !privateKey) {
+    throw new Error(
+      "Missing Salesforce JWT config (SF_CLIENT_ID, SF_USERNAME, SF_PRIVATE_KEY)"
+    );
+  }
+
+  // Build JWT payload
+  const nowSec = Math.floor(Date.now() / 1000);
+  const payload = {
+    iss: clientId, // Connected App Consumer Key
+    sub: username, // Salesforce user to impersonate
+    aud: loginUrl, // audience: login URL
+    exp: nowSec + 300, // expires in 5 minutes
+  };
+
+  // Sign JWT with RS256 using your private key (PEM)
+  const token = jwt.sign(payload, privateKey, { algorithm: "RS256" });
+
+  // Exchange JWT for an access token
+  const tokenUrl = `${loginUrl}/services/oauth2/token`;
+  const body = querystring.stringify({
+    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    assertion: token,
   });
+
+  const tokenResp = await axios.post(tokenUrl, body, {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    timeout: 15000,
+  });
+
+  if (!tokenResp || tokenResp.status !== 200) {
+    throw new Error(
+      "Failed to obtain Salesforce access token: " +
+        (tokenResp && tokenResp.status)
+    );
+  }
+
+  const data = tokenResp.data;
+  if (!data.access_token || !data.instance_url) {
+    throw new Error(
+      "Salesforce token response missing access_token or instance_url: " +
+        JSON.stringify(data)
+    );
+  }
+
+  // Create jsforce connection using the token
+  const conn = new jsforce.Connection({
+    instanceUrl: data.instance_url,
+    accessToken: data.access_token,
+  });
+
+  // Optionally set conn.version if you want specific API version:
+  // conn.version = '60.0';
+
   return conn;
 }
 

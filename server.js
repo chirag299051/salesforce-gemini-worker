@@ -1,285 +1,382 @@
 // server.js
-require("dotenv").config();
+// Worker service: downloads PDF from Salesforce, calls Gemini, parses JSON, writes records back to Salesforce.
+// Uses JWT Bearer flow for Salesforce (requires SF_PRIVATE_KEY, SF_CLIENT_ID, SF_USERNAME).
+//
+// Required env vars:
+//  - WORKER_SECRET
+//  - GEMINI_ENDPOINT
+//  - GEMINI_API_KEY
+//  - SF_LOGIN_URL          (e.g. https://login.salesforce.com or https://test.salesforce.com)
+//  - SF_CLIENT_ID
+//  - SF_USERNAME
+//  - SF_PRIVATE_KEY        (supports "\n" escaped newlines)
+// Optional:
+//  - PORT
+//
+// npm i express axios body-parser dotenv jsonwebtoken
+
 const express = require("express");
-const bodyParser = require("body-parser");
-const jsforce = require("jsforce");
 const axios = require("axios");
-const FormData = require("form-data");
+const bodyParser = require("body-parser");
+const jwt = require("jsonwebtoken");
+require("dotenv").config();
+
+const {
+  WORKER_SECRET,
+  GEMINI_ENDPOINT,
+  GEMINI_API_KEY,
+  SF_LOGIN_URL,
+  SF_CLIENT_ID,
+  SF_USERNAME,
+  SF_PRIVATE_KEY,
+  PORT = 3000,
+} = process.env;
+
+if (!WORKER_SECRET) throw new Error("WORKER_SECRET is required in .env");
+if (!GEMINI_ENDPOINT || !GEMINI_API_KEY)
+  throw new Error("GEMINI_ENDPOINT and GEMINI_API_KEY required in .env");
+if (!SF_LOGIN_URL || !SF_CLIENT_ID || !SF_USERNAME)
+  throw new Error("SF_LOGIN_URL, SF_CLIENT_ID, SF_USERNAME required in .env");
+if (!SF_PRIVATE_KEY)
+  throw new Error("SF_PRIVATE_KEY required in .env for JWT flow");
+
+const API_VERSION = "v58.0";
 
 const app = express();
-app.use(bodyParser.json({ limit: "10mb" })); // small notifications only
+app.use(bodyParser.json({ limit: "10mb" }));
 
-const PORT = process.env.PORT || 8080;
-const WORKER_SECRET = process.env.WORKER_SECRET; // must match Named Credential header
-const GEMINI_ENDPOINT = process.env.GEMINI_ENDPOINT; // e.g. https://your-gemini-proxy.example.com/analyze
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // if needed by your Gemini/proxy
-const SF_LOGIN_URL = process.env.SF_LOGIN_URL || "https://login.salesforce.com";
-const SF_CLIENT_ID = process.env.SF_CLIENT_ID;
-const SF_USERNAME = process.env.SF_USERNAME;
-const SF_PRIVATE_KEY = process.env.SF_PRIVATE_KEY; // PEM content, newlines escaped as \n or actual newlines
-
-if (
-  !WORKER_SECRET ||
-  !GEMINI_ENDPOINT ||
-  !SF_CLIENT_ID ||
-  !SF_USERNAME ||
-  !SF_PRIVATE_KEY
-) {
-  console.error("Missing required env vars. See README.");
-  process.exit(1);
-}
-
-const jwt = require("jsonwebtoken");
-const querystring = require("querystring");
-
-// helper: perform JWT Bearer flow and return an authenticated jsforce Connection
-async function getSalesforceConnection() {
-  // Required env vars: SF_LOGIN_URL, SF_CLIENT_ID, SF_USERNAME, SF_PRIVATE_KEY
-  const loginUrl = process.env.SF_LOGIN_URL || "https://login.salesforce.com";
-  const clientId = process.env.SF_CLIENT_ID;
-  const username = process.env.SF_USERNAME;
-  const privateKey = process.env.SF_PRIVATE_KEY;
-
-  if (!clientId || !username || !privateKey) {
-    throw new Error(
-      "Missing Salesforce JWT config (SF_CLIENT_ID, SF_USERNAME, SF_PRIVATE_KEY)"
-    );
+// Normalize private key: allow user to store with \n sequences in .env
+function normalizePrivateKey(pk) {
+  if (!pk) return pk;
+  // If it already contains newlines, return as-is
+  if (pk.indexOf("\\n") !== -1) {
+    return pk.replace(/\\n/g, "\n");
   }
+  return pk;
+}
+const PRIVATE_KEY = normalizePrivateKey(SF_PRIVATE_KEY);
 
-  // Build JWT payload
-  const nowSec = Math.floor(Date.now() / 1000);
+// Create a Salesforce access token using JWT Bearer flow
+async function getSalesforceAccessTokenViaJWT() {
+  const now = Math.floor(Date.now() / 1000);
   const payload = {
-    iss: clientId, // Connected App Consumer Key
-    sub: username, // Salesforce user to impersonate
-    aud: loginUrl, // audience: login URL
-    exp: nowSec + 300, // expires in 5 minutes
+    iss: SF_CLIENT_ID, // client id (connected app)
+    sub: SF_USERNAME, // username of integration user
+    aud: SF_LOGIN_URL, // audience: login.salesforce.com or test.salesforce.com
+    exp: now + 180, // short expiry (3 minutes)
   };
 
-  // Sign JWT with RS256 using your private key (PEM)
-  const token = jwt.sign(payload, privateKey, { algorithm: "RS256" });
+  // Sign JWT using RSA SHA256
+  const token = jwt.sign(payload, PRIVATE_KEY, { algorithm: "RS256" });
 
-  // Exchange JWT for an access token
-  const tokenUrl = `${loginUrl}/services/oauth2/token`;
-  const body = querystring.stringify({
-    grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-    assertion: token,
+  const url = `${SF_LOGIN_URL}/services/oauth2/token`;
+  const params = new URLSearchParams();
+  params.append("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer");
+  params.append("assertion", token);
+
+  const res = await axios.post(url, params).catch((err) => {
+    const body = err.response ? JSON.stringify(err.response.data) : err.message;
+    throw new Error("Failed to get SF access token (JWT): " + body);
   });
 
-  const tokenResp = await axios.post(tokenUrl, body, {
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    timeout: 15000,
-  });
-
-  if (!tokenResp || tokenResp.status !== 200) {
-    throw new Error(
-      "Failed to obtain Salesforce access token: " +
-        (tokenResp && tokenResp.status)
-    );
-  }
-
-  const data = tokenResp.data;
-  if (!data.access_token || !data.instance_url) {
-    throw new Error(
-      "Salesforce token response missing access_token or instance_url: " +
-        JSON.stringify(data)
-    );
-  }
-
-  // Create jsforce connection using the token
-  const conn = new jsforce.Connection({
-    instanceUrl: data.instance_url,
-    accessToken: data.access_token,
-  });
-
-  // Optionally set conn.version if you want specific API version:
-  // conn.version = '60.0';
-
-  return conn;
+  if (!res.data || !res.data.access_token)
+    throw new Error("No access_token in SF JWT token response");
+  return res.data.access_token;
 }
 
-// Download latest ContentVersion VersionData as Buffer
-async function downloadPdfBuffer(conn, contentDocumentId) {
-  // Query latest content version id
-  const qry = `SELECT Id, Title FROM ContentVersion WHERE ContentDocumentId='${contentDocumentId}' AND IsLatest=true LIMIT 1`;
-  const qr = await conn.query(qry);
-  if (!qr.records || qr.records.length === 0)
-    throw new Error("No ContentVersion found for " + contentDocumentId);
-  const cv = qr.records[0];
-  const versionId = cv.Id;
-  const url = `/services/data/v${conn.version}/sobjects/ContentVersion/${versionId}/VersionData`;
-  // conn.request returns Buffer when responseType is set
-  const res = await conn.request({
-    method: "GET",
-    url: url,
-    encoding: null,
-    headers: { Accept: "application/octet-stream" },
-  });
-  // jsforce returns a Buffer-like – ensure Buffer
-  const buffer = Buffer.isBuffer(res) ? res : Buffer.from(res, "binary");
-  return { buffer, title: cv.Title, versionId };
+// Download ContentVersion VersionData bytes
+async function downloadContentVersion(versionId, accessToken) {
+  const url = `${SF_LOGIN_URL}/services/data/${API_VERSION}/sobjects/ContentVersion/${versionId}/VersionData`;
+  const r = await axios
+    .get(url, {
+      responseType: "arraybuffer",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    })
+    .catch((err) => {
+      const body = err.response
+        ? JSON.stringify(err.response.data)
+        : err.message;
+      throw new Error("Failed to download ContentVersion VersionData: " + body);
+    });
+  return Buffer.from(r.data);
 }
 
-// Call Gemini (multipart). Assumes GEMINI_ENDPOINT accepts multipart 'instructions' and 'file' fields.
-// If your Gemini endpoint needs different fields, adapt here.
-async function callGeminiWithPdf(buffer, filename, prompt) {
-  const form = new FormData();
-  form.append("instructions", prompt);
-  form.append("file", buffer, {
-    filename: filename,
-    contentType: "application/pdf",
-  });
-
-  const headers = Object.assign({}, form.getHeaders());
-  if (GEMINI_API_KEY) headers["Authorization"] = `Bearer ${GEMINI_API_KEY}`;
-
-  const res = await axios.post(GEMINI_ENDPOINT, form, {
-    headers,
-    maxContentLength: 200 * 1024 * 1024,
-    maxBodyLength: 200 * 1024 * 1024,
-    timeout: 120000,
-  });
-  return res.data; // assume JSON
+// Create generic SObject via REST API
+async function createSObject(sobjectName, body, accessToken) {
+  const url = `${SF_LOGIN_URL}/services/data/${API_VERSION}/sobjects/${sobjectName}/`;
+  const r = await axios
+    .post(url, body, { headers: { Authorization: `Bearer ${accessToken}` } })
+    .catch((err) => {
+      const body = err.response
+        ? JSON.stringify(err.response.data)
+        : err.message;
+      throw new Error(`Failed to create ${sobjectName}: ${body}`);
+    });
+  return r.data;
 }
 
-// Insert claim + product line items into Salesforce via REST (using jsforce)
-async function persistParsedToSalesforce(conn, parsed, linkedEntityId) {
-  // parsed = { patientName, claimedAmount, approvedAmount, lineItems: [ ... ] }
-  const claim = {
-    Name: parsed.title || "Claim " + Date.now(),
-    Patient_Name__c: parsed.patientName || null,
-    Claimed_Amount__c: parsed.claimedAmount || null,
-    Approved_Amount__c: parsed.approvedAmount || null,
-    Opportunity__c: linkedEntityId || null, // optional field; adapt to your schema
+// Query helper
+async function querySalesforce(soql, accessToken) {
+  const url = `${SF_LOGIN_URL}/services/data/${API_VERSION}/query/?q=${encodeURIComponent(
+    soql
+  )}`;
+  const r = await axios
+    .get(url, { headers: { Authorization: `Bearer ${accessToken}` } })
+    .catch((err) => {
+      const body = err.response
+        ? JSON.stringify(err.response.data)
+        : err.message;
+      throw new Error("SF SOQL query failed: " + body);
+    });
+  return r.data;
+}
+
+// Create ContentDocumentLink
+async function createContentDocumentLink(
+  contentDocumentId,
+  linkedEntityId,
+  accessToken
+) {
+  const url = `${SF_LOGIN_URL}/services/data/${API_VERSION}/sobjects/ContentDocumentLink/`;
+  const body = {
+    ContentDocumentId: contentDocumentId,
+    LinkedEntityId: linkedEntityId,
+    ShareType: "V",
+    Visibility: "AllUsers",
   };
-  const createdClaim = await conn.sobject("Insurance_Claim__c").create(claim);
-  if (!createdClaim || !createdClaim.id)
-    throw new Error("Failed to create claim: " + JSON.stringify(createdClaim));
-
-  const claimId = createdClaim.id;
-
-  // Build product line items
-  const lineItems =
-    parsed.lineItems && Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
-  const productSObjects = [];
-  for (const li of lineItems) {
-    const ip = {
-      Insurance_Claim__c: claimId,
-      Description__c: li.description || null,
-      Line_Number__c: li.lineNumber ? parseInt(li.lineNumber) : null,
-      Quantity__c: li.quantity ? parseFloat(li.quantity) : null,
-      Unit__c: li.unit || null,
-      RCV_Amount__c: li.rcv
-        ? parseFloat(String(li.rcv).replace(/[^0-9\.\-]/g, ""))
-        : null,
-      Depreciation_Amount__c: li.depreciation
-        ? parseFloat(String(li.depreciation).replace(/[^0-9\.\-]/g, ""))
-        : null,
-      ACV_Amount__c: li.acv
-        ? parseFloat(String(li.acv).replace(/[^0-9\.\-]/g, ""))
-        : null,
-      TAX_Amount__c: li.tax
-        ? parseFloat(String(li.tax).replace(/[^0-9\.\-]/g, ""))
-        : null,
-      OP_Amount__c: li.op
-        ? parseFloat(String(li.op).replace(/[^0-9\.\-]/g, ""))
-        : null,
-      Section__c: li.section || null,
-    };
-    productSObjects.push(ip);
-  }
-
-  // Insert in batches (jsforce supports bulk create, but we'll use sobject.create in chunks)
-  const BATCH = 50;
-  for (let i = 0; i < productSObjects.length; i += BATCH) {
-    const chunk = productSObjects.slice(i, i + BATCH);
-    await conn.sobject("Insurance_Product__c").create(chunk);
-  }
-
-  return claimId;
+  const r = await axios
+    .post(url, body, { headers: { Authorization: `Bearer ${accessToken}` } })
+    .catch((err) => {
+      const body = err.response
+        ? JSON.stringify(err.response.data)
+        : err.message;
+      throw new Error("Failed to create ContentDocumentLink: " + body);
+    });
+  return r.data;
 }
 
-// Helper to update PDF_Work_Item__c status
-async function updateWorkItemStatus(conn, workItemId, status, errorDetail) {
-  const s = { Id: workItemId, Status__c: status };
-  if (errorDetail)
-    s.Error_Detail__c =
-      errorDetail.length > 32000
-        ? errorDetail.substring(0, 32000)
-        : errorDetail;
-  await conn.sobject("PDF_Work_Item__c").update(s);
+// Call Gemini with base64 PDF inline
+async function callGeminiWithPdfBase64(base64Pdf, prompt) {
+  const url = `${GEMINI_ENDPOINT}?key=${GEMINI_API_KEY}`;
+  const payload = {
+    contents: [
+      {
+        parts: [
+          { text: prompt },
+          {
+            inline_data: {
+              mime_type: "application/pdf",
+              data: base64Pdf,
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const r = await axios.post(url, payload, { timeout: 120000 }).catch((err) => {
+    const body = err.response ? JSON.stringify(err.response.data) : err.message;
+    throw new Error("Gemini call failed: " + body);
+  });
+  return r.data;
 }
 
-app.post("/process", async (req, res) => {
-  try {
-    const authHeader = req.headers["authorization"];
-    if (!authHeader || authHeader !== `Bearer ${WORKER_SECRET}`) {
-      console.warn(
-        "Unauthorized request, auth header:",
-        req.headers["authorization"]
-      );
-      return res.status(403).json({ error: "Forbidden" });
-    }
-    const items = req.body;
-    if (!Array.isArray(items) || items.length === 0) {
-      console.warn("Bad payload:", JSON.stringify(items).slice(0, 200));
-      return res
-        .status(400)
-        .json({ error: "Expected non-empty array of work items" });
-    }
+// Extract text (candidate content) from Gemini response
+function extractTextFromGeminiResp(geminiResp) {
+  if (!geminiResp) return null;
+  const candidates = geminiResp.candidates;
+  if (!Array.isArray(candidates) || candidates.length === 0) return null;
+  const content = candidates[0].content;
+  if (!content || !Array.isArray(content.parts) || content.parts.length === 0)
+    return null;
+  for (const p of content.parts) {
+    if (p && typeof p.text === "string") return p.text;
+  }
+  return null;
+}
 
-    const conn = await getSalesforceConnection(); // your JWT exchange helper
-    for (const it of items) {
+// Best-effort JSON extraction from text
+function extractJsonFromText(text) {
+  if (!text) return null;
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first >= 0 && last > first) {
+    const sub = text.substring(first, last + 1);
+    try {
+      return JSON.parse(sub);
+    } catch (e) {
+      // try sanitize control chars
+      const sanitized = sub.replace(/[\x00-\x1F\x7F]/g, "");
       try {
-        if (!it.contentDocumentId) throw new Error("missing contentDocumentId");
-        // process item (download pdf, call gemini, persist result)...
-      } catch (itemErr) {
-        console.error(
-          "Item processing error:",
-          itemErr && itemErr.stack ? itemErr.stack : itemErr
-        );
-        // update work item as Error in Salesforce if possible
+        return JSON.parse(sanitized);
+      } catch (e2) {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+// Middleware: verify worker secret
+function verifyWorkerSecret(req, res, next) {
+  const secretHeader =
+    req.headers["x-worker-secret"] || req.headers["x-worker-token"];
+  if (!secretHeader || secretHeader !== WORKER_SECRET) {
+    return res.status(401).json({ error: "Invalid worker secret" });
+  }
+  next();
+}
+
+// Main endpoint
+app.post("/process", verifyWorkerSecret, async (req, res) => {
+  try {
+    const { contentDocumentId, originContentVersionId, linkedOpportunityId } =
+      req.body;
+    if (!originContentVersionId)
+      return res.status(400).json({ error: "originContentVersionId required" });
+
+    console.log("Job received for version:", originContentVersionId);
+
+    // 1) SF access token via JWT
+    const accessToken = await getSalesforceAccessTokenViaJWT();
+
+    // 2) Download PDF bytes
+    const pdfBuf = await downloadContentVersion(
+      originContentVersionId,
+      accessToken
+    );
+    console.log("Downloaded PDF bytes:", pdfBuf.length);
+
+    // 3) Call Gemini
+    const base64Pdf = pdfBuf.toString("base64");
+    const prompt = `Extract the details and return only valid JSON. Do not include markdown, comments, or text outside the JSON object.
+{ "patientName": "", "claimedAmount": "", "approvedAmount": "", "lineItems": [ { "lineNumber": "", "productName": "", "description": "", "quantity": "", "unit": "", "rcv": "", "depreciation": "", "acv": "", "tax": "", "op": "", "section": "" } ] }.
+Return valid JSON only.`;
+    const geminiResp = await callGeminiWithPdfBase64(base64Pdf, prompt);
+    console.log("Gemini response received");
+
+    // 4) Extract & parse JSON
+    const text = extractTextFromGeminiResp(geminiResp);
+    if (!text)
+      return res.status(500).json({
+        error: "No textual candidate found in Gemini response",
+        geminiResp,
+      });
+
+    const parsed = extractJsonFromText(text);
+    if (!parsed) {
+      // optional: save full geminiResp to SF for manual inspection (omitted here)
+      return res
+        .status(500)
+        .json({ error: "Failed to parse JSON from Gemini text", text });
+    }
+
+    // 5) Create Insurance_Claim__c
+    const claimBody = {
+      Name: parsed.patientName
+        ? parsed.patientName + " - Claim"
+        : "Claim " + Date.now(),
+      Patient_Name__c: parsed.patientName || null,
+      Claimed_Amount__c: parsed.claimedAmount || null,
+      Approved_Amount__c: parsed.approvedAmount || null,
+      Opportunity__c: linkedOpportunityId || null,
+    };
+    const claimResult = await createSObject(
+      "Insurance_Claim__c",
+      claimBody,
+      accessToken
+    );
+    const claimId = claimResult.id;
+    console.log("Created claim:", claimId);
+
+    // 6) Line items & products
+    if (Array.isArray(parsed.lineItems)) {
+      for (const li of parsed.lineItems) {
+        const prodName =
+          li.productName ||
+          (li.description || "").substring(0, 60) ||
+          "Unnamed Product";
+
+        // Try find existing product
+        let productId = null;
         try {
-          await updateWorkItemStatus(
-            conn,
-            it.workItemId,
-            "Error",
-            String(itemErr.message || itemErr)
+          const q = `SELECT Id, Name FROM Product2 WHERE Name = '${prodName.replace(
+            /'/g,
+            "\\'"
+          )}' LIMIT 1`;
+          const qres = await querySalesforce(q, accessToken);
+          if (qres.records && qres.records.length > 0)
+            productId = qres.records[0].Id;
+        } catch (err) {
+          console.warn("Product lookup error:", err.message || err);
+        }
+
+        if (!productId) {
+          try {
+            const pr = await createSObject(
+              "Product2",
+              { Name: prodName },
+              accessToken
+            );
+            productId = pr.id;
+          } catch (err) {
+            console.warn("Failed to create Product2:", err.message || err);
+          }
+        }
+
+        const ipBody = {
+          Insurance_Claim__c: claimId,
+          Description__c: li.description || null,
+          Quantity__c: li.quantity ? Number(li.quantity) : null,
+          Unit__c: li.unit || null,
+          RCV_Amount__c: li.rcv || null,
+          Depreciation_Amount__c: li.depreciation || null,
+          ACV_Amount__c: li.acv || null,
+          TAX_Amount__c: li.tax || null,
+          OP_Amount__c: li.op || null,
+          Section__c: li.section || null,
+        };
+        if (productId) ipBody.Product__c = productId;
+
+        try {
+          const ipRes = await createSObject(
+            "Insurance_Product__c",
+            ipBody,
+            accessToken
           );
-        } catch (updErr) {
-          console.error(
-            "Failed to update work item status for",
-            it.workItemId,
-            updErr && updErr.message
+          console.log("Created Insurance_Product__c", ipRes.id);
+        } catch (err) {
+          console.warn(
+            "Failed to create Insurance_Product__c:",
+            err.message || err
           );
         }
-        // continue processing other items
       }
     }
 
-    return res.status(202).json({ status: "accepted", count: items.length });
-  } catch (err) {
-    // If axios error, include server's response body (helpful)
-    let detail = String(err && err.message ? err.message : err);
-    if (err && err.response && err.response.data) {
+    // 7) Link ContentDocument <-> Claim
+    if (contentDocumentId && claimId) {
       try {
-        detail +=
-          " | remote:" +
-          (typeof err.response.data === "string"
-            ? err.response.data
-            : JSON.stringify(err.response.data));
-      } catch (e) {
-        detail += " | (error serializing remote response)";
+        await createContentDocumentLink(
+          contentDocumentId,
+          claimId,
+          accessToken
+        );
+        console.log("Linked ContentDocument to claim");
+      } catch (err) {
+        console.warn(
+          "Failed to create ContentDocumentLink:",
+          err.message || err
+        );
       }
     }
-    console.error(
-      "Fatal worker error:",
-      detail,
-      err && err.stack ? err.stack : ""
-    );
-    return res.status(500).json({ error: detail });
+
+    return res.status(200).json({ ok: true, claimId });
+  } catch (err) {
+    console.error("Worker error:", (err && err.message) || err);
+    return res.status(500).json({ error: (err && err.message) || String(err) });
   }
 });
 
-app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-app.listen(PORT, () => console.log(`Worker ready on ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Worker listening on port ${PORT}`);
+});
